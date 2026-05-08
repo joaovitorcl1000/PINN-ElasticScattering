@@ -1,25 +1,52 @@
-import numpy as np
-import pandas as pd
-import os
-import random
-import torch as tc
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import copy
-from dataclasses import dataclass
+# =============================================================================
+# Author: João Vitor Costa Lovato, UFSC, Brazil
+# email: joaovitorcl1000@gmail.com
+# Date: May, 8, 2026
+# =============================================================================
 
-tc.set_num_threads(14)
+# =============================================================================
+# 1. DATA SCIENCE & SYSTEM UTILITIES
+# =============================================================================
+# Standard libraries for data manipulation, file system operations, and reproducibility
+import numpy as np         # High-performance multidimensional array operations
+import pandas as pd        # Data manipulation and analysis for CSV/table structures
+import os                  # Operating system interface for file and path management
+import random              # Generation of pseudo-random numbers for stochastic processes
+
+# =============================================================================
+# 2. DEEP LEARNING FRAMEWORK (PYTORCH)
+# =============================================================================
+# Core library and submodules for building and training Neural Networks
+import torch as tc         # Main PyTorch library (aliased as tc for consistency)
+import torch.nn as nn      # Neural network layers and modules (Linear, ReLU, etc.)
+import torch.optim as optim # Optimization algorithms (Adam, SGD, etc.)
+import torch.nn.functional as F # Functional interface for activation functions and loss
+
+# =============================================================================
+# 3. HELPER UTILITIES
+# =============================================================================
+# Tools for object management and clean data structures
+import copy                # Support for deep and shallow copy operations of model weights
+from dataclasses import dataclass # Decorator to create concise, specialized data classes
+
+# =============================================================================
+# 4. DATA VISUALIZATION
+# =============================================================================
+# Tools for plotting physics results and managing complex legends
+import matplotlib.pyplot as plt   # Primary framework for scientific plotting
+from matplotlib.lines import Line2D # Tool for building custom legend proxies manually
 
 #--------------------------------------------------------------------------------------------------
 
+#number of threads used
+tc.set_num_threads(14)
+
 num_replicas = 1    # Number of MC Replicas
 n_epochs = 1000000     # Number of epochs
-target_loss = 5e1     # Stop training, it's a great loss.
+target_loss = 4e1     # Stop training, it's a great loss.
 
 patience_limit = 10000  # Wait that long; if the learning stagnates, return to the best value of the loss (jump).
-threshold = 1.0e2       # It only saves if the loss (cost function) is less than that.
+threshold = 4.0e1       # It only saves if the loss (cost function) is less than that.
 max_jumps = 3           # Limit of times the network can "jump" before Early Stopping.
 
 replica_fraction = 0.8 # Fraction of data used in the train
@@ -67,6 +94,8 @@ class NormalizationStats:
     log_s_std : tc.Tensor
     Delta_mean: tc.Tensor
     Delta_std : tc.Tensor
+    log_Delta_mean: tc.Tensor
+    log_Delta_std : tc.Tensor
     Y_mean    : tc.Tensor
     Y_std     : tc.Tensor
 
@@ -96,6 +125,7 @@ class ScatteringData:
         s_pp = sqrt_s **2
         log_s = np.log(s_pp).astype(np.float32)
         Delta = np.sqrt(t_abs)
+        log_Delta = np.log(np.sqrt(t_abs) + 1e-9)
         c_star = 1e0 # GeV
         Y     = np.log(dsig_dt/c_star)
 
@@ -115,6 +145,7 @@ class ScatteringData:
         
         self.Y_tc         = prep(Y)
         self.Delta_tc     = prep(Delta)
+        self.log_Delta_tc     = prep(log_Delta)
         self.sqrt_s_tc = prep(sqrt_s)
         self.s_tc         = prep(s_pp)
         self.log_s_tc = prep(log_s)
@@ -133,6 +164,8 @@ class ScatteringData:
             log_s_std  = self.log_s_tc.std() + 1e-12,
             Delta_mean = self.Delta_tc.mean(),
             Delta_std  = self.Delta_tc.std() + 1e-12,
+            log_Delta_mean = self.log_Delta_tc.mean(),
+            log_Delta_std  = self.log_Delta_tc.std() + 1e-12,
             Y_mean     = self.Y_tc.mean(),
             Y_std      = self.Y_tc.std() + 1e-12
         )
@@ -143,6 +176,8 @@ class ScatteringData:
         self.log_s_tc_std  = self.stats.log_s_std
         self.Delta_tc_mean = self.stats.Delta_mean
         self.Delta_tc_std  = self.stats.Delta_std
+        self.log_Delta_tc_mean = self.stats.log_Delta_mean
+        self.log_Delta_tc_std  = self.stats.log_Delta_std
         
     # =============================================================================
     # REPLICAS & SPLITTING
@@ -161,6 +196,8 @@ class ScatteringData:
         subset.log_s_tc_std  = self.log_s_tc_std
         subset.Delta_tc_mean = self.Delta_tc_mean
         subset.Delta_tc_std  = self.Delta_tc_std
+        subset.log_Delta_tc_mean = self.log_Delta_tc_mean
+        subset.log_Delta_tc_std  = self.log_Delta_tc_std
 
         subset.mode_raw = self.mode_raw[indices.cpu().numpy()] if tc.is_tensor(indices) else self.mode_raw[indices]
         
@@ -169,6 +206,7 @@ class ScatteringData:
         subset.log_s_tc = self.log_s_tc[indices]
         subset.sqrt_s_tc = self.sqrt_s_tc[indices]
         subset.Delta_tc     = self.Delta_tc[indices]
+        subset.log_Delta_tc     = self.log_Delta_tc[indices]
         subset.Y_tc         = self.Y_tc[indices]
         subset.Err_plus_tc  = self.Err_plus_tc[indices]
         subset.Err_mnus_tc  = self.Err_mnus_tc[indices]
@@ -202,31 +240,23 @@ class ScatteringData:
         y_replica_values = self.Y_tc.clone() + fluctuation
 
         # 2. Energy-based splitting (Golden Rule for Scattering Data)
-        sqrt_s_flat = self.sqrt_s_tc.view(-1)
-        unique_energy = tc.unique(sqrt_s_flat)
-        
-        n_unique = unique_energy.numel()
-        shuffled_idx = tc.randperm(n_unique, device=self.device) # Alternative without shuffle the data tc.arange(n_unique, device=self.device)
+        n_points = self.Y_tc.shape[0]
+        # Index Random permutation (0 a 3247)
+        shuffled_indices = tc.randperm(n_points, device=self.device)
 
-        split_mark = int(n_unique * split_ratio)
-        train_energies = unique_energy[shuffled_idx[:split_mark]]
-        
-        # Create masks
-        # Logical 'isin' checks which points belong to the selected training energies
-        train_mask = tc.isin(sqrt_s_flat, train_energies)
-        
-        # Indices extraction
-        train_idx = tc.where(train_mask)[0]
-        val_idx   = tc.where(~train_mask)[0] # Improved: val is simply NOT train
+        split_mark = int(n_points * split_ratio)
+        train_idx = shuffled_indices[:split_mark]
+        val_idx   = shuffled_indices[split_mark:]
 
         # 3. Build the subsets
         data_train = self._subset(train_idx)
         data_val   = self._subset(val_idx)
         
         # Apply the fluctuated Y values to the training set only (or both, depending on your methodology)
-        # Usually, validation uses original data, but for replicas, we use fluctuated for both.
         data_train.Y_tc = y_replica_values[train_idx]
-        data_val.Y_tc   = y_replica_values[val_idx]
+
+        # Usually, validation uses original data at the central.
+        data_val.Y_tc   = self.Y_tc[val_idx]
 
         return data_train, data_val
 
@@ -243,41 +273,58 @@ data = ScatteringData(csv_path="data.csv", device=device)
 # =============================================================================
 
 class NNAmplitude(nn.Module):
-    def __init__(self):
+    def __init__(self, hidden_dim=64):
         super().__init__()
 
-        # ---------------- NN residual ----------------
-        self.net = nn.Sequential(
-            nn.Linear(2, 32), nn.SiLU(),
-            nn.Linear(32, 32), nn.SiLU(),
-            nn.Linear(32, 2)
-        )
+        # Input Layer
+        self.input_layer = nn.Linear(2, hidden_dim)
         
-        # ------ Initiate the weights and bias -----------
-        # We start with zero weights and biases in the last layer to have the theory
-        for m in self.net:
+        self.layer1 = nn.Linear(hidden_dim, hidden_dim)
+        self.layer2 = nn.Linear(hidden_dim, hidden_dim)
+        self.layer3 = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Smooth activation
+        self.activation = nn.SiLU() 
+        
+        # Output Layer (Real and Imaginary part)
+        self.output_layer = nn.Linear(hidden_dim, 2)
+        
+        # Initialization
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 nn.init.constant_(m.bias, 0.0)
-        nn.init.constant_(self.net[-1].weight, 0.0)
-        nn.init.constant_(self.net[-1].bias, 0.0)
-    
-    # ----------------------------------------------------------------
-    # ----------------------- NN function ----------------------------
-    # ----------------------------------------------------------------
-    def forward(self, log_s_z, Delta_z):
-        # Purely scaled inputs and outputs (Z-score)
-        nn_in = tc.cat([log_s_z, Delta_z], dim=1)
-        # Return [out_R, out_I]
-        return self.net(nn_in) 
+        
+        # We begin with zero at output
+        nn.init.constant_(self.output_layer.weight, 0.0)
+        nn.init.constant_(self.output_layer.bias, 0.0)
+
+    def forward(self, log_s_z, log_Delta_z):
+        x = tc.cat([log_s_z, log_Delta_z], dim=1)
+        
+        #Layers
+        x = self.activation(self.input_layer(x))
+        
+        identity = x
+        x = self.activation(self.layer1(x))
+        x = self.activation(self.layer2(x + identity)) 
+        
+        identity = x
+        x = self.activation(self.layer3(x))
+        x = x + identity 
+        
+        return self.output_layer(x)
     
 # =============================================================================
 # 4. PHYSICAL MODEL
 # =============================================================================
 
-class PhysicalAmplitude(nn.Module): # <--- FIX: Removed ScatteringData from here
-    def __init__(self, scattering_instance): # <--- Pass the already loaded data instance
-        super().__init__() # Now this correctly initializes ONLY nn.Module
+class PhysicalAmplitude(nn.Module): 
+    def __init__(self, scattering_instance): 
+        super().__init__() 
 
         # Store the reference to the data object
         self.data_ref = scattering_instance
@@ -287,9 +334,11 @@ class PhysicalAmplitude(nn.Module): # <--- FIX: Removed ScatteringData from here
         self.register_buffer("log_s_std",  scattering_instance.log_s_tc_std)
         self.register_buffer("Delta_mean", scattering_instance.Delta_tc_mean)
         self.register_buffer("Delta_std",  scattering_instance.Delta_tc_std)
+        self.register_buffer("log_Delta_mean", scattering_instance.log_Delta_tc_mean)
+        self.register_buffer("log_Delta_std",  scattering_instance.log_Delta_tc_std)
 
         # Instantiate the neural network internally
-        self.nn_amp = NNAmplitude().to(self.device)            
+        self.nn_amp = NNAmplitude().to(self.device)
         
         # ---------------- t-shape baseline ----------------
         # B(s) = B0 + 2 alpha_prime ln(s/s_regge)
@@ -299,14 +348,14 @@ class PhysicalAmplitude(nn.Module): # <--- FIX: Removed ScatteringData from here
                 
         # ---------------- Power for dipole-like baseline ----------------
         # n(s) = n0 + n1 * (s/s0)^(-eps)
-        self.n0 = nn.Parameter(tc.tensor([4.0]))   # The low-energy pQCD limit (Dimensionless)
-        self.n0.requires_grad_(True)
+        self.n0 = nn.Parameter(tc.tensor([4.0]))   # The low-energy pQCD limit (Dimensionless) Fixed
+        self.n0.requires_grad_(False)
         
-        self.n1 = nn.Parameter(tc.tensor([1e-3]))   # Growth rate with energy (Dimensionless)
+        self.n1 = nn.Parameter(tc.tensor([1e0]))   # Growth rate with energy (Dimensionless) Learning
         self.n1.requires_grad_(True)           
 
-        self.epsilon = nn.Parameter(tc.tensor([0.05])) 
-        self.epsilon.requires_grad_(False)             
+        self.epsilon = nn.Parameter(tc.tensor([0.05])) # Growth Power, Learning
+        self.epsilon.requires_grad_(True)             
 
         self.register_buffer("log_s0", tc.tensor(0.0))  # ln((1 GeV)^2)
 
@@ -334,24 +383,28 @@ class PhysicalAmplitude(nn.Module): # <--- FIX: Removed ScatteringData from here
         self.to(device)
 
         # For the integration int dt dsigma/dt 
-        # 2. Create the t-grid (momentum transfer)
+        # We create the t-grid (momentum transfer)
         t_grid = tc.logspace(np.log10(1e-5), np.log10(50.0), 200)
         self.register_buffer("t_grid_integration", t_grid)
 
     def _normalize(self, s, Delta):
         """
-        Internal method: Now uses INTERNAL BUFFERS for normalization.
-        No external data dependency!
+        Normalizes the entries of the NN
         """
         if s.dim() == 1: s = s.view(-1, 1)
         if Delta.dim() == 1: Delta = Delta.view(-1, 1)
         
         ln_s = tc.log(s)
+        log_Delta = tc.log(Delta)
         
         ln_s_z = (ln_s - self.log_s_mean) / self.log_s_std
-        Delta_z = (Delta - self.Delta_mean) / self.Delta_std
+        log_Delta_z = (log_Delta - self.log_Delta_mean) / self.log_Delta_std
         
-        return ln_s_z, Delta_z
+        return ln_s_z, log_Delta_z
+    
+    # ---------------- sigma_tot(s) ----------------------------------
+    # COMPETE PARAMETERIZATION (Phys. Rev. Lett 89 (2002) 201801)
+    # ----------------------------------------------------------------
 
     def sigma_tot(self, s, mode):
         log_s = tc.log(s)        
@@ -379,6 +432,7 @@ class PhysicalAmplitude(nn.Module): # <--- FIX: Removed ScatteringData from here
     # rho(s) via Derivative Dispersion Relation (DDR):
     # rho approx (pi/2) * (1/sigma_tot) * d sigma_tot / d ln(s)
     # ----------------------------------------------------------------
+
     def rho(self, s, mode):
         ln_s = tc.log(s)
         # Scales
@@ -420,45 +474,44 @@ class PhysicalAmplitude(nn.Module): # <--- FIX: Removed ScatteringData from here
         This is the "brain" of the model.
         """
         # A. Physical Scales Conversion
-        ln_s_z, Delta_z = self._normalize(s, Delta)
+        ln_s_z, log_Delta_z = self._normalize(s, Delta)
         ln_s = tc.log(s)
         
         # B. Neural Network Residuals
-        nn_out = self.nn_amp(ln_s_z, Delta_z)
+        nn_out = self.nn_amp(ln_s_z, log_Delta_z)
         out_R, out_I = nn_out[:, 0:1], nn_out[:, 1:2]
 
         # C. Physics Baseline (COMPETE + Dipole)
         sig_tot = self.sigma_tot(s, mode)
         rho_val = self.rho(s, mode)
-        
-        n_eff = self.n0 + self.n1 * (ln_s - self.log_s0)
-         #tc.clamp(self.n0 + tc.abs(self.n1) * tc.exp(-tc.abs(self.epsilon) * (ln_s - self.log_s0)), min=1e-3)
-        B_s   = self.B0 + 2.0 * self.alpha_prime * (ln_s - self.log_s_regge)
-        
-        Aux_dip = tc.clamp(1.0 + (B_s * Delta**2) / n_eff, min=1e-7)
-        F_dip   = tc.exp(-n_eff * tc.log(Aux_dip))
 
         # D. Assembling the Amplitude with NN Corrections
         energy_suppr = tc.sqrt(s)
 
-        f_R = out_R 
-        f_I = out_I 
-
         support = (Delta / energy_suppr)
 
-        # Real (F_R) and Imaginary (F_I) profile components
-        F_R =  (rho_val + f_R * support) * F_dip
-        F_I = (1.0     + f_I * support) * F_dip
+        f_R = out_R * support 
+        f_I = out_I * support
 
-        # Elastic Amplitude components
-        Re_A_el = s*sig_tot*F_R
-        Im_A_el = s*sig_tot*F_I
+        # Real (F_R) and Imaginary (F_I) profile components
+        n_eff = tc.clamp(self.n0 + tc.abs(self.n1) * tc.exp(-tc.abs(self.epsilon) * (ln_s - self.log_s0)), min=1.0)
+        B_s   = tc.clamp(self.B0 + 2.0 * self.alpha_prime * (ln_s - self.log_s_regge), min=1e-3)
+
+        base = tc.clamp(1.0 + (B_s * Delta**2) / n_eff, min=1e-7)
+        F_dip = tc.exp(-n_eff * tc.log(base))
+
+        F_R = (rho_val + f_R) * F_dip
+        F_I = (1.0 + f_I) * F_dip
         
+        Re_A_el = s * sig_tot * F_R  
+        Im_A_el = s * sig_tot * F_I
+
         return Re_A_el, Im_A_el
 
     # ----------------------------------------------------------------
-    # Differential Cross Section
+    # Differential Elastic Cross Section
     # ----------------------------------------------------------------
+
     def dsigma_dt(self, s, Delta, mode):
         """
         Orchestrates the amplitude calculation and returns dsigma/dt.
@@ -475,6 +528,7 @@ class PhysicalAmplitude(nn.Module): # <--- FIX: Removed ScatteringData from here
     # ----------------------------------------------------------------
     # Cross Sections
     # ----------------------------------------------------------------
+
     def sigmas(self, s, mode):
         # 1. Ensure s is a 1D vector
         s_flat = s.view(-1)
@@ -520,6 +574,9 @@ def chi2(y_pred, data):
     Computes the statistical Chi2 given the predicted values and the dataset.
     This avoids re-running the Neural Network multiple times.
     """
+    if data.Y_tc.numel() == 0:
+        return tc.tensor(0.0, device=y_pred.device)
+
     # Residual: Prediction - Target
     residuals = y_pred - data.Y_tc
     
@@ -527,14 +584,14 @@ def chi2(y_pred, data):
     # If residual >= 0, prediction is above data -> use Err_plus
     # If residual < 0, prediction is below data -> use Err_mnus
     Err_eff = tc.where(residuals >= 0, data.Err_log_p_tc, data.Err_log_m_tc)
-    
-    chi2_val = tc.mean((residuals / (Err_eff + 1e-12))**2)
+
+    chi2_val = tc.mean((residuals / (Err_eff + 1e-12))**2)   
     
     return chi2_val
 
 def cost_function(model, data, epoch):
     """
-    Calculates the total loss: Statistical Chi2 + Curvature Physics + Unitarity.
+    Calculates the total loss: Statistical Chi2 + Unitarity.
     """
     # 1. Prepare Data
     # Calculate s from sqrt_s. We need s to be a tensor for the model.
@@ -566,28 +623,6 @@ def cost_function(model, data, epoch):
     chi2_val = chi2(y_pred, data)
 
     # -------------------------------------------------------------------------
-    # 3. Curvature Penalty (Second derivative wrt Delta)
-    # -------------------------------------------------------------------------
-    first_derivative = tc.autograd.grad(
-        outputs=y_pred,
-        inputs=Delta_tc,             # Taking derivative with respect to Delta
-        grad_outputs=tc.ones_like(y_pred),
-        create_graph=True,
-        retain_graph=True
-    )[0]
-
-    second_derivative = tc.autograd.grad(
-        outputs=first_derivative,
-        inputs=Delta_tc,             # Taking derivative of the derivative
-        grad_outputs=tc.ones_like(first_derivative),
-        create_graph=True,
-        retain_graph=True
-    )[0]
-
-    lambda_curv = 1e-3
-    loss_curv = lambda_curv * tc.mean(second_derivative**2)
-
-    # -------------------------------------------------------------------------
     # 4. Unitarity Penalty (sigma_el <= sigma_tot)
     # -------------------------------------------------------------------------
 
@@ -612,7 +647,7 @@ def cost_function(model, data, epoch):
     # Final Loss
     # -------------------------------------------------------------------------
 
-    total_loss = chi2_val + loss_curv + lu
+    total_loss = chi2_val + lu
     
     return total_loss, chi2_val
 
@@ -638,7 +673,7 @@ for rep in range(num_replicas):
     print("="*60)
 
     # 1. Generate fluctuated and split data for this replica
-    data_train, data_val = data.generate_replica_split(split_ratio=0.8)
+    data_train, data_val = data.generate_replica_split(split_ratio=replica_fraction)
 
     # 2. Instantiate the network FROM SCRATCH to ensure independence
     model = PhysicalAmplitude(data).to(device)
@@ -702,11 +737,12 @@ for rep in range(num_replicas):
             if mask_pbarp.any():
                 pred_pbarp = model.dsigma_dt(s_val[mask_pbarp], Delta_val[mask_pbarp], "pbarp")
                 y_pred_val[mask_pbarp] = tc.log(tc.clamp(pred_pbarp, min=1e-30))
-
-            loss_val = chi2(y_pred_val, data_val).item()
             
-            # 3. Compute statistical Chi2
-            loss_val = chi2(y_pred_val, data_val).item()
+            if data_val.Y_tc.numel() > 0:
+                # 3. Compute statistical Chi2
+                loss_val = chi2(y_pred_val, data_val).item()
+            else:
+                loss_val = chi2_train.item()    
 
         loss_hist.append(loss_val)
 
@@ -830,6 +866,7 @@ print("="*60)
 # -------------------------------------------------------------
 # DISPLAYING PHYSICAL PARAMETERS OF THE BEST NETWORK
 # -------------------------------------------------------------
+
 if len(trained_models) > 0:
     idx_best = int(np.argmin(approved_val_losses))
     best_model = trained_models[idx_best]
@@ -845,103 +882,107 @@ print(f"ep adjusted:   {best_model.epsilon.item():.4f}")
 
 # =============================================================================
 # Plotting the Elastic Differential Cross Section (Model vs Data)
+# Using Offset/Scaling technique to separate curves by energy levels
 # =============================================================================
 
-# 1. Choose the target energies you want to plot (in GeV)
+# 1. Define target energies for the plot (in GeV)
 target_energies = [23.5, 30.7, 44.7, 52.8, 62.5, 7000.0, 13000.0]
 
-# 2. Create a dense grid for -t (momentum transfer) to plot smooth theoretical curves
-t_dense_np = np.linspace(0.001, 10.0, 500)
+# 2. Define scaling factors (offsets) to prevent overlapping
+# Each energy level is shifted down by a power of 10 for visual clarity
+offsets = {
+    23.5:    1e0,    # Top curve (Original scale)
+    30.7:    1e-2,   # Shifted down by 10^2
+    44.7:    1e-4,   
+    52.8:    1e-6,   
+    62.5:    1e-8,   
+    7000.0:  1e-11,  
+    13000.0: 1e-14   
+}
+
+# 3. Create a dense grid for momentum transfer |t| for smooth predictions
+t_dense_np = np.linspace(0.001, 6.0, 500)
 Delta_dense_np = np.sqrt(t_dense_np).astype(np.float32)
 
-# Convert the dense grid to a PyTorch tensor on the correct device
+# Convert grid to PyTorch tensor and move to current device
 Delta_tc_pred = tc.tensor(Delta_dense_np, dtype=tc.float32, device=device).view(-1, 1)
 
-# Set up the matplotlib figure
-fig, ax = plt.subplots(figsize=(10, 8))
+# Initialize figure with higher vertical ratio for stacked plots
+fig, ax = plt.subplots(figsize=(10, 12))
 
 for i, E in enumerate(target_energies):
-    # --- A. Plotting the Experimental Data ---
-    # Tolerance for energy matching (larger tolerance for high energies)
-    tol = 0.5 if E < 100 else 50.0
+    # Retrieve specific scaling factor for this energy
+    factor = offsets.get(E, 1.0)
+    text_energy = f'{E/1000:g} TeV' if E >= 1000 else f'{E:g} GeV'
     
-    # Filter the original DataFrame for the specific energy
-    mask = (
-    (data.df_fit['sqrt_s_GeV'] > E - tol) &
-    (data.df_fit['sqrt_s_GeV'] < E + tol) &
-    (data.df_fit['mode'] == "pp")
-    )
+    # --- A. Process Experimental Data ---
+    # Apply relative tolerance for energy matching
+    tol = E * 0.05 
+    mask = (np.abs(data.df_fit['sqrt_s_GeV'] - E) < tol) & (data.df_fit['mode'] == "pp")
     df_E = data.df_fit[mask]
 
     if len(df_E) > 0:
         x_data = np.abs(df_E['t_GeV2'].values)
-        y_data = df_E['dsig_dt_mb_GeV2'].values
+        # Apply scaling factor to central values and uncertainties
+        y_data = df_E['dsig_dt_mb_GeV2'].values * factor
+        y_err_p = df_E['err_total_plus'].values * factor
+        y_err_m = df_E['err_total_minus'].values * factor
         
-        # Absolute errors
-        err_plus = np.abs(df_E['err_total_plus'].values)
-        err_minus = np.abs(df_E['err_total_minus'].values)
-        
-        # Prevent negative lower error bars on a log scale plot
-        err_minus = np.minimum(err_minus, y_data * 0.9999)
+        # Ensure lower error bars don't hit zero or negative values in log scale
+        y_err_m = np.minimum(y_err_m, y_data * 0.9)
 
         ax.errorbar(
-            x_data, y_data,
-            yerr=[err_minus, err_plus],
-            fmt='o', color='red',
-            markersize=4, capsize=0,
-            label='pp Data' if i == 0 else ""
+            x_data, y_data, yerr=[y_err_m, y_err_p],
+            fmt='o', color='blue', markersize=3, capsize=0, 
+            alpha=0.8, zorder=2
         )
 
-    # --- B. Plotting the Theoretical Model ---
+    # --- B. Process Neural Network Prediction ---
     s_val = E**2
-    
-    # Create a tensor for s with the same shape as the Delta grid
     s_tc_pred = tc.full((len(t_dense_np), 1), s_val, dtype=tc.float32, device=device)
 
-    # Put the best model in evaluation mode
     best_model.eval()
     with tc.no_grad():
-        # The model gracefully handles all the physical equations and normalizations!
+        # Predict cross section and apply the same scaling factor
         dsigma_dt_pred = best_model.dsigma_dt(s_tc_pred, Delta_tc_pred, "pp")
-        
-        # Bring the prediction back to the CPU as a numpy array for plotting
-        y_pred_np = dsigma_dt_pred.cpu().numpy().flatten()
+        y_pred_np = dsigma_dt_pred.cpu().numpy().flatten() * factor
 
-    ax.plot(t_dense_np, y_pred_np, 'k-', linewidth=2, label='NN Model' if i == 0 else "")
+    # Plot continuous theoretical curve
+    ax.plot(t_dense_np, y_pred_np, 'k-', linewidth=1.5, zorder=3)
 
-    # --- C. Add Energy Labels to the curves ---
-    text_energy = f'{E/1000:g} TeV' if E >= 1000 else f'{E:g} GeV'
-    
-    # Find a good spot to place the text (e.g., around t = 3.5)
+    # --- C. Dynamic Labeling ---
+    # Place energy labels near t = 3.5 GeV^2 as per classical physics plots
     idx_text = np.argmin(np.abs(t_dense_np - 3.5))
     ax.text(
-        3.5,
-        y_pred_np[idx_text] * 1.5,
-        text_energy,
-        fontsize=11,
-        fontweight='bold',
-        verticalalignment='bottom'
+        3.5, y_pred_np[idx_text] * 2.5, # Vertical offset multiplier for text positioning
+        text_energy, fontsize=10, fontweight='bold', ha='center'
     )
 
 # -------------------------------------------------------------
-# 4. Figure Formatting (Scientific Style)
+# 4. Final Formatting & Publication Style
 # -------------------------------------------------------------
+
 ax.set_yscale('log')
 ax.set_xlim(0, 6)
+# Adjust Y-limit to accommodate the lowest scaled energy (10^-14)
+ax.set_ylim(1e-21, 1e4) 
 
-# Scientific labels using LaTeX formatting
-ax.set_xlabel(r'$-t \ (\text{GeV}^2)$', fontsize=14)
-ax.set_ylabel(r'$\frac{d\sigma}{dt} \ (\text{mb/GeV}^2)$', fontsize=14)
+# Scientific labels using LaTeX
+ax.set_xlabel(r'$|t| \ (\text{GeV}^2)$', fontsize=14)
+ax.set_ylabel(r'$d\sigma/dt \ (\text{mb/GeV}^2)$', fontsize=14)
 
-# Inward pointing ticks, standard for physics publications
+# Inward pointing ticks (Standard for HEP papers)
 ax.tick_params(axis='both', which='major', labelsize=12, direction='in', length=6)
 ax.tick_params(axis='both', which='minor', direction='in', length=3)
 
-# Clean legend
-ax.legend(loc='upper right', frameon=False, fontsize=12)
+custom_lines = [
+    Line2D([0], [0], color='black', lw=2, label='Model'),
+    Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', markersize=8, label='pp data')
+]
+ax.legend(handles=custom_lines, loc='upper right', frameon=False, fontsize=12)
 
 plt.tight_layout()
-plt.savefig("Diff_elastic_cross_sections.png", dpi=300) 
+plt.savefig("Diff_elastic_cross_sections_offset.png", dpi=300)
 plt.show()
 
 # =============================================================================
@@ -950,44 +991,37 @@ plt.show()
 
 best_model.eval()
 
-# Energies of interest
 plot_energies = [62.5, 7000.0, 13000.0]
 t_eval = np.linspace(0.001, 10.0, 500)
 Delta_eval_np = np.sqrt(t_eval).astype(np.float32)
 
-# Transform Delta to a Tensor in physical units
-# Using best_model.device ensures everything stays on the same hardware (CPU/GPU)
 Delta_tc = tc.tensor(Delta_eval_np, dtype=tc.float32, device=best_model.device).view(-1, 1)
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
 for E in plot_energies:
-    # 1. Prepare the physical 's' tensor (Energy squared)
     s_val = E**2
     s_tc = tc.full((len(t_eval), 1), s_val, dtype=tc.float32, device=best_model.device)
     
-    # 2. THE MAGIC: Use the model's internal normalizer!
-    # Returns Z-scores ready for the Neural Network
     log_s_z, Delta_z = best_model._normalize(s_tc, Delta_tc)
 
     with tc.no_grad():
-        # 3. Direct pass through the internal Neural Network
         nn_out = best_model.nn_amp(log_s_z, Delta_z)
-        
-        # Unpack the Neural Network output [500, 2]
-        # Column 0 = Real, Column 1 = Imaginary
         res_R = nn_out[:, 0].cpu().numpy()
         res_I = nn_out[:, 1].cpu().numpy()
 
     label = f'{E/1000:g} TeV' if E >= 1000 else f'{E:g} GeV'
     
-    # Calculate the modulated residual: Delta * NN / sqrt(s)
-    # Note: sqrt(s) is exactly E. We use numpy arrays for plotting.
     y_plot_R = Delta_eval_np * res_R / E
     y_plot_I = Delta_eval_np * res_I / E
     
     ax1.plot(t_eval, y_plot_R, label=label, linewidth=2)
     ax2.plot(t_eval, y_plot_I, label=label, linewidth=2)
+
+ax1.set_title("Real Residual ($f_R$)")
+ax2.set_title("Imaginary Residual ($f_I$)")
+ax1.legend(); ax2.legend()
+plt.show()
 
 # -------------------------------------------------------------
 # Formatting Real Axis
