@@ -982,7 +982,7 @@ custom_lines = [
 ax.legend(handles=custom_lines, loc='upper right', frameon=False, fontsize=12)
 
 plt.tight_layout()
-plt.savefig("Diff_elastic_cross_sections_offset.png", dpi=300)
+plt.savefig("outputs/plots/Diff_elastic_cross_sections_offset.png", dpi=300)
 plt.show()
 
 # =============================================================================
@@ -1044,7 +1044,7 @@ ax2.grid(True, alpha=0.3)
 ax2.legend()
 
 plt.tight_layout()
-plt.savefig("nn_residuals_fixed.png", dpi=300)
+plt.savefig("outputs/plots/nn_residuals_fixed.png", dpi=300)
 plt.show()
 
 # -------------------------------------------------------------
@@ -1108,5 +1108,5 @@ plt.grid(True, which="both", ls="-", alpha=0.2)
 plt.legend(fontsize=12, frameon=False, loc='upper left')
 
 plt.tight_layout()
-plt.savefig("Integrated_cross_sections.png", dpi=300)
+plt.savefig("outputs/plots/Integrated_cross_sections.png", dpi=300)
 plt.show()
