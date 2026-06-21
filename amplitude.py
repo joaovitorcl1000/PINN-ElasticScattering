@@ -648,7 +648,7 @@ ax.grid(True, which='both', ls='-', alpha=0.1)
 ax.legend(loc='upper right', frameon=False, fontsize=10)
 
 plt.tight_layout()
-plt.savefig("ensemble_dsigma_dt.png", dpi=300)
+plt.savefig("outputs/plots/ensemble_dsigma_dt.png", dpi=300)
 plt.show()
 
 # =============================================================================
@@ -829,5 +829,5 @@ plt.grid(True, which="both", ls="-", alpha=0.2)
 plt.legend(fontsize=12, frameon=False, loc='upper left')
 
 plt.tight_layout()
-plt.savefig("integrated_cross_sections_ensemble.png", dpi=300)
+plt.savefig("outputs/plots/integrated_cross_sections_ensemble.png", dpi=300)
 plt.show()
